@@ -1,0 +1,42 @@
+[package]
+name = "navi-llm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "llm_test"
+path = "src/bin/llm_test.rs"
+
+[[bin]]
+name = "session_test"
+path = "src/bin/session_test.rs"
+
+[[bin]]
+name = "tool_call_demo"
+path = "src/bin/tool_call_demo.rs"
+
+[[bin]]
+name = "vllm_test"
+path = "src/bin/vllm_test.rs"
+
+[[bin]]
+name = "vision_test"
+path = "src/bin/vision_test.rs"
+
+[features]
+default = []
+cuda = ["llama-cpp-2/cuda"]
+metal = ["llama-cpp-2/metal"]
+
+[dependencies]
+llama-cpp-2 = { version = "=0.1.138", features = ["mtmd"] }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+encoding_rs = "0.8"
+tracing-appender = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

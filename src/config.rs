@@ -28,6 +28,8 @@ pub struct LlmConfig {
     pub enable_thinking: bool,
     /// GBNF 语法字符串，用于约束输出格式 (例如强制 JSON 输出)
     pub grammar: Option<String>,
+    /// 是否启用 8-bit 量化 KV Cache (Q8_0)，可显著减少内存占用
+    pub kv_cache_q8: bool,
 }
 
 impl LlmConfig {
@@ -45,6 +47,7 @@ impl LlmConfig {
             system_prompt: None,
             enable_thinking: true,
             grammar: None,
+            kv_cache_q8: false,
         }
     }
 
@@ -105,6 +108,15 @@ impl LlmConfig {
     /// 设置视觉投影模型路径
     pub fn with_mmproj<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.mmproj_path = Some(path.into());
+        self
+    }
+
+    /// 启用 8-bit 量化 KV Cache (Q8_0)
+    ///
+    /// 开启后 K Cache 和 V Cache 均使用 Q8_0 量化，
+    /// 可大幅降低 KV Cache 内存占用（约为 F16 的一半），对生成质量影响极小。
+    pub fn with_kv_cache_q8(mut self, enable: bool) -> Self {
+        self.kv_cache_q8 = enable;
         self
     }
 }

@@ -4,7 +4,7 @@
 //! 使用增量编码方案，复用 KV Cache，避免重复 prefilling。
 
 use anyhow::{Context, Result};
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::context::LlamaContext;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -274,9 +274,15 @@ impl LlmSessionFactory {
             .map_err(|e| anyhow::anyhow!("无法解码图像: {:?}", e))?;
 
         let n_threads = self.config.n_threads.unwrap_or(4);
-        let ctx_params = LlamaContextParams::default()
+        let mut ctx_params = LlamaContextParams::default()
             .with_n_threads(n_threads)
             .with_n_ctx(Some(self.config.ctx_size));
+
+        if self.config.kv_cache_q8 {
+            ctx_params = ctx_params
+                .with_type_k(KvCacheType::Q8_0)
+                .with_type_v(KvCacheType::Q8_0);
+        }
 
         let mut context = self.model.new_context(&self.backend, ctx_params)?;
 
@@ -419,6 +425,12 @@ impl<'a> ManagedSession<'a> {
         chat_template: LlamaChatTemplate,
     ) -> Result<Self> {
         let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(config.ctx_size));
+
+        if config.kv_cache_q8 {
+            ctx_params = ctx_params
+                .with_type_k(KvCacheType::Q8_0)
+                .with_type_v(KvCacheType::Q8_0);
+        }
 
         if let Some(threads) = config.n_threads {
             ctx_params = ctx_params.with_n_threads(threads);

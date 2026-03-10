@@ -1,5 +1,4 @@
 use std::ffi::CString;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -10,62 +9,36 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
-use llama_cpp_2::sampling::LlamaSampler;
-use std::num::NonZeroU32;
 
-#[derive(Debug, Clone)]
-pub struct VisionConfig {
-    pub model_path: PathBuf,
-    pub mmproj_path: PathBuf,
-    pub ctx_size: NonZeroU32,
-    pub max_tokens: u32,
-    pub n_threads: Option<i32>,
-    pub seed: u32,
-    pub enable_thinking: bool,
-}
-
-impl VisionConfig {
-    pub fn new<P1: Into<PathBuf>, P2: Into<PathBuf>>(model_path: P1, mmproj_path: P2) -> Self {
-        Self {
-            model_path: model_path.into(),
-            mmproj_path: mmproj_path.into(),
-            ctx_size: NonZeroU32::new(4096).unwrap(),
-            max_tokens: 1024,
-            n_threads: None,
-            seed: 1234,
-            enable_thinking: true,
-        }
-    }
-
-    pub fn with_ctx_size(mut self, size: u32) -> Self {
-        if let Some(s) = NonZeroU32::new(size) {
-            self.ctx_size = s;
-        }
-        self
-    }
-
-    pub fn with_enable_thinking(mut self, enable: bool) -> Self {
-        self.enable_thinking = enable;
-        self
-    }
-}
+use crate::config::LlmConfig;
+use crate::sampler;
 
 pub struct VisionLlmModel {
     backend: Arc<LlamaBackend>,
     model: LlamaModel,
     mtmd_ctx: MtmdContext,
-    config: VisionConfig,
+    config: LlmConfig,
 }
 
 impl VisionLlmModel {
-    pub fn load(config: VisionConfig) -> Result<Self> {
+    pub fn load(config: LlmConfig) -> Result<Self> {
         let backend = Arc::new(LlamaBackend::init().context("Failed to init backend")?);
         Self::load_with_backend(backend, config)
     }
 
-    pub fn load_with_backend(backend: Arc<LlamaBackend>, config: VisionConfig) -> Result<Self> {
+    pub fn load_with_backend(backend: Arc<LlamaBackend>, config: LlmConfig) -> Result<Self> {
+        let mmproj_path = config
+            .mmproj_path
+            .as_ref()
+            .context("VisionLlmModel 需要配置 mmproj_path")?;
+
         let mut model_params = LlamaModelParams::default();
-        model_params = model_params.with_n_gpu_layers(1_000_000); // Use all layers on GPU
+        if let Some(n) = config.n_gpu_layers {
+            model_params = model_params.with_n_gpu_layers(n);
+        } else {
+            // 视觉推理默认全部 offload
+            model_params = model_params.with_n_gpu_layers(1_000_000);
+        }
 
         let model = LlamaModel::load_from_file(
             &backend,
@@ -82,11 +55,11 @@ impl VisionLlmModel {
         };
 
         let mtmd_ctx = MtmdContext::init_from_file(
-            config.mmproj_path.to_string_lossy().as_ref(),
+            &mmproj_path.to_string_lossy(),
             &model,
             &mtmd_params,
         )
-        .with_context(|| format!("Failed to load mmproj: {:?}", config.mmproj_path))?;
+        .with_context(|| format!("Failed to load mmproj: {:?}", mmproj_path))?;
 
         Ok(Self {
             backend,
@@ -122,14 +95,17 @@ impl VisionLlmModel {
         let messages_json = serde_json::json!([{"role": "user", "content": full_prompt}]);
         let messages_json_str = serde_json::to_string(&messages_json)?;
 
+        let thinking_kwargs = serde_json::json!({
+            "enable_thinking": self.config.enable_thinking
+        }).to_string();
         let params = OpenAIChatTemplateParams {
             messages_json: &messages_json_str,
             tools_json: None,
             tool_choice: None,
             json_schema: None,
             grammar: None,
-            reasoning_format: None,
-            chat_template_kwargs: None,
+            reasoning_format: if self.config.enable_thinking { Some("deepseek") } else { None },
+            chat_template_kwargs: Some(&thinking_kwargs),
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
@@ -153,7 +129,7 @@ impl VisionLlmModel {
         let chunks = self.mtmd_ctx.tokenize(input_text, &bitmap_refs)?;
         let n_past = chunks.eval_chunks(&self.mtmd_ctx, &mut context, 0, 0, 1, true)?;
 
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        let mut sampler = sampler::build_sampler(&self.config);
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
 
@@ -245,14 +221,17 @@ impl VisionLlmModel {
         let messages_json = serde_json::json!([{"role": "user", "content": full_prompt}]);
         let messages_json_str = serde_json::to_string(&messages_json)?;
 
+        let thinking_kwargs = serde_json::json!({
+            "enable_thinking": self.config.enable_thinking
+        }).to_string();
         let params = OpenAIChatTemplateParams {
             messages_json: &messages_json_str,
             tools_json: None,
             tool_choice: None,
             json_schema: None,
             grammar: None,
-            reasoning_format: None,
-            chat_template_kwargs: None,
+            reasoning_format: if self.config.enable_thinking { Some("deepseek") } else { None },
+            chat_template_kwargs: Some(&thinking_kwargs),
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
@@ -276,7 +255,7 @@ impl VisionLlmModel {
         let chunks = self.mtmd_ctx.tokenize(input_text, &bitmap_refs)?;
         let n_past = chunks.eval_chunks(&self.mtmd_ctx, &mut context, 0, 0, 1, true)?;
 
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        let mut sampler = sampler::build_sampler(&self.config);
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
 

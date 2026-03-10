@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use navi_llm::{VisionConfig, VisionLlmModel};
+use navi_llm::{LlmConfig, VisionLlmModel};
 use std::io::{self, Write};
 
 #[derive(Parser, Debug)]
@@ -42,7 +42,8 @@ fn main() -> Result<()> {
     println!("模型路径: {}", args.model);
     println!("投影路径: {}", args.mmproj);
 
-    let config = VisionConfig::new(&args.model, &args.mmproj)
+    let config = LlmConfig::new(&args.model)
+        .with_mmproj(&args.mmproj)
         .with_ctx_size(4096)
         .with_enable_thinking(!args.no_think);
 

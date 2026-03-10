@@ -29,11 +29,12 @@
 
 mod config;
 mod model;
+mod sampler;
 mod session;
 mod vision;
 
-pub use config::LlmConfig;
+pub use config::{LlmConfig, SamplingMode};
 pub use llama_cpp_2::llama_backend::LlamaBackend;
 pub use model::LlmModel;
 pub use session::{ChatMessage, LlmSessionFactory, ManagedSession, Role, SessionStats};
-pub use vision::{VisionConfig, VisionLlmModel};
+pub use vision::VisionLlmModel;

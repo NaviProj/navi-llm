@@ -8,10 +8,10 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::AddBos;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
-use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
 use crate::config::LlmConfig;
+use crate::sampler;
 
 /// LLM 模型包装器
 pub struct LlmModel {
@@ -33,7 +33,11 @@ impl LlmModel {
         let backend = LlamaBackend::init().context("无法初始化 llama 后端")?;
 
         // 配置模型参数
-        let model_params = LlamaModelParams::default();
+        let mut model_params = LlamaModelParams::default();
+        if let Some(n) = config.n_gpu_layers {
+            model_params = model_params.with_n_gpu_layers(n);
+        }
+        let model_params = model_params;
 
         // 加载模型
         let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
@@ -106,10 +110,7 @@ impl LlmModel {
         ctx.decode(&mut batch).context("prompt 解码失败")?;
 
         // 创建采样器
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::dist(self.config.seed),
-            LlamaSampler::greedy(),
-        ]);
+        let mut sampler = sampler::build_sampler(&self.config);
 
         // 生成循环
         let mut n_cur = batch.n_tokens();
@@ -119,6 +120,7 @@ impl LlmModel {
         while n_cur <= n_len {
             // 采样下一个 token
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
 
             // 检查是否结束
             if self.model.is_eog_token(token) {
@@ -207,10 +209,7 @@ impl LlmModel {
         ctx.decode(&mut batch).context("prompt 解码失败")?;
 
         // 创建采样器
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::dist(self.config.seed),
-            LlamaSampler::greedy(),
-        ]);
+        let mut sampler = sampler::build_sampler(&self.config);
 
         // 生成循环
         let mut n_cur = batch.n_tokens();
@@ -220,6 +219,7 @@ impl LlmModel {
         while n_cur <= n_len {
             // 采样下一个 token
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            sampler.accept(token);
 
             // 检查是否结束
             if self.model.is_eog_token(token) {
@@ -282,14 +282,17 @@ impl LlmModel {
 
         let messages_json_str = serde_json::to_string(&messages_json).context("序列化消息失败")?;
 
+        let thinking_kwargs = serde_json::json!({
+            "enable_thinking": self.config.enable_thinking
+        }).to_string();
         let params = OpenAIChatTemplateParams {
             messages_json: &messages_json_str,
             tools_json: None,
             tool_choice: None,
             json_schema: None,
             grammar: None,
-            reasoning_format: None,
-            chat_template_kwargs: None,
+            reasoning_format: if self.config.enable_thinking { Some("deepseek") } else { None },
+            chat_template_kwargs: Some(&thinking_kwargs),
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
@@ -302,8 +305,10 @@ impl LlmModel {
         match self.model.apply_chat_template_oaicompat(&tmpl, &params) {
             Ok(result) => {
                 tracing::debug!(
-                    "Chat template applied (enable_thinking={})",
-                    self.config.enable_thinking
+                    "Chat template applied (enable_thinking={}, thinking_forced_open={})\n--- rendered prompt ---\n{}\n--- end ---",
+                    self.config.enable_thinking,
+                    result.thinking_forced_open,
+                    result.prompt,
                 );
                 Ok(result.prompt)
             }

@@ -21,6 +21,7 @@ use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
 use crate::config::LlmConfig;
+use crate::sampler;
 
 /// 对话消息角色
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,9 +142,12 @@ impl LlmSessionFactory {
         tracing::info!("正在加载本地 LLM 模型 (Factory): {:?}", config.model_path);
         let start = std::time::Instant::now();
 
-        // 如果配置了 mmproj，使用 GPU 加速加载模型（视觉推理需要）
+        // GPU offload 配置
         let mut model_params = LlamaModelParams::default();
-        if config.mmproj_path.is_some() {
+        if let Some(n) = config.n_gpu_layers {
+            model_params = model_params.with_n_gpu_layers(n);
+        } else if config.mmproj_path.is_some() {
+            // 视觉推理默认全部 offload
             model_params = model_params.with_n_gpu_layers(1_000_000);
         }
         let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
@@ -211,6 +215,19 @@ impl LlmSessionFactory {
         ctx_size: Option<u32>,
         max_tokens: Option<u32>,
     ) -> Result<ManagedSession<'_>> {
+        self.create_session_with_full_options(ctx_size, max_tokens, None, None)
+    }
+
+    /// 创建带完整自定义选项的独立会话
+    ///
+    /// 允许覆盖 ctx_size、max_tokens、kv_cache_q8 和 enable_thinking
+    pub fn create_session_with_full_options(
+        &self,
+        ctx_size: Option<u32>,
+        max_tokens: Option<u32>,
+        kv_cache_q8: Option<bool>,
+        enable_thinking: Option<bool>,
+    ) -> Result<ManagedSession<'_>> {
         let mut config = self.config.clone();
         if let Some(s) = ctx_size {
             if let Some(nz) = std::num::NonZeroU32::new(s) {
@@ -219,6 +236,12 @@ impl LlmSessionFactory {
         }
         if let Some(t) = max_tokens {
             config.max_tokens = t;
+        }
+        if let Some(q8) = kv_cache_q8 {
+            config.kv_cache_q8 = q8;
+        }
+        if let Some(et) = enable_thinking {
+            config.enable_thinking = et;
         }
 
         ManagedSession::new(
@@ -298,14 +321,17 @@ impl LlmSessionFactory {
         let messages_json = serde_json::json!([{"role": "user", "content": full_prompt}]);
         let messages_json_str = serde_json::to_string(&messages_json)?;
 
+        let thinking_kwargs = serde_json::json!({
+            "enable_thinking": self.config.enable_thinking
+        }).to_string();
         let params = OpenAIChatTemplateParams {
             messages_json: &messages_json_str,
             tools_json: None,
             tool_choice: None,
             json_schema: None,
             grammar: None,
-            reasoning_format: None,
-            chat_template_kwargs: None,
+            reasoning_format: if self.config.enable_thinking { Some("deepseek") } else { None },
+            chat_template_kwargs: Some(&thinking_kwargs),
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
@@ -329,7 +355,7 @@ impl LlmSessionFactory {
         let chunks = mtmd_ctx.tokenize(input_text, &bitmap_refs)?;
         let n_past = chunks.eval_chunks(mtmd_ctx, &mut context, 0, 0, 1, true)?;
 
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        let mut sampler = sampler::build_sampler(&self.config);
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
 
@@ -447,10 +473,7 @@ impl<'a> ManagedSession<'a> {
 
         let ctx_size = ctx.n_ctx();
 
-        // Sampler: 使用 dist 采样器
-        // 注意: Grammar 在当前 llama-cpp-2 版本中有兼容性问题，暂不使用
-        let _ = config.grammar.as_ref(); // 避免 unused 警告
-        let sampler = LlamaSampler::dist(config.seed);
+        let sampler = sampler::build_sampler(&config);
 
         let mut messages = Vec::new();
         if let Some(ref system_prompt) = config.system_prompt {
@@ -656,12 +679,34 @@ impl<'a> ManagedSession<'a> {
         let max_tokens = self.config.max_tokens as i32;
         let n_len = self.n_past + max_tokens;
 
+        // Thinking 处理：当 thinking_forced_open 为 true 时，模型输出从 <think> 内部开始。
+        // 需要将 thinking 内容从回调中过滤，只将 </think> 之后的响应发送给调用方。
+        let thinking_forced = result.thinking_forced_open;
+        let mut think_ended = !thinking_forced;
+        let mut think_search_start: usize = 0;
+
         // 采样索引：decode 后 logits 在 batch 的最后一个 token 位置
         // batch.n_tokens() - 1 就是正确的索引（此时 batch 一定非空）
         let mut logit_idx = batch.n_tokens() - 1;
 
         // 构建采样链：如果模板提供了 grammar，则使用 grammar 采样器
-        let mut grammar_sampler = if let Some(grammar) = result.grammar.as_deref() {
+        // 当 enable_thinking=true 时跳过 grammar 采样器：思考模式下 grammar 的 lazy 触发器
+        // 在 </think> 转换期间会激活，但 Qwen3 的实际工具调用 token 序列（<tool_call> 标签）
+        // 与生成的 grammar 规则不匹配，导致所有 grammar stacks 被耗尽并触发
+        // llama.cpp 中的 GGML_ASSERT(!stacks.empty()) abort。
+        if let Some(grammar) = result.grammar.as_deref() {
+            tracing::debug!(
+                "Grammar from template (lazy={}, triggers={}, preserved={}): {}",
+                result.grammar_lazy,
+                result.grammar_triggers.len(),
+                result.preserved_tokens.len(),
+                if grammar.len() > 200 { &grammar[..200] } else { grammar }
+            );
+        }
+        let mut grammar_sampler = if self.config.enable_thinking {
+            tracing::debug!("Thinking mode enabled — skipping grammar sampler to avoid empty-stack abort");
+            None
+        } else if let Some(grammar) = result.grammar.as_deref() {
             tracing::info!("使用 Grammar 采样器进行生成");
             let gs = if result.grammar_lazy {
                 let mut preserved = std::collections::HashSet::new();
@@ -707,11 +752,7 @@ impl<'a> ManagedSession<'a> {
             } else {
                 LlamaSampler::grammar(&self.model, grammar, "root")?
             };
-            // 将 grammar 采样器与基础分布式采样器链式结合
-            Some(LlamaSampler::chain_simple([
-                gs,
-                LlamaSampler::dist(self.config.seed),
-            ]))
+            Some(sampler::build_grammar_sampler(gs))
         } else {
             None
         };
@@ -728,9 +769,11 @@ impl<'a> ManagedSession<'a> {
             // 采样
             let token = if let Some(ref mut gs) = grammar_sampler {
                 let t = gs.sample(&self.ctx, logit_idx);
+                gs.accept(t);
                 t
             } else {
                 let t = self.sampler.sample(&self.ctx, logit_idx);
+                self.sampler.accept(t);
                 t
             };
 
@@ -764,8 +807,22 @@ impl<'a> ManagedSession<'a> {
                         }
                     }
                 }
+            } else if !think_ended {
+                // 正在 thinking 阶段，不发送给回调。仅从最近追加位置附近搜索 </think>
+                let search_from = think_search_start.saturating_sub("</think>".len());
+                if let Some(rel_pos) = output[search_from..].find("</think>") {
+                    think_ended = true;
+                    let abs_pos = search_from + rel_pos + "</think>".len();
+                    let trailing = &output[abs_pos..];
+                    if !trailing.is_empty() {
+                        if let Some(ref mut cb) = callback {
+                            cb(trailing);
+                        }
+                    }
+                }
+                think_search_start = output.len();
             } else {
-                // 流式回调原始文本
+                // 普通模式：流式回调原始文本
                 if let Some(ref mut cb) = callback {
                     cb(&token_str);
                 }
@@ -795,20 +852,41 @@ impl<'a> ManagedSession<'a> {
         }
 
         let duration = start_time.elapsed();
+
+        // 7. 处理 thinking 输出
+        // 如果 thinking_forced_open，模型输出从 <think> 内部开始，raw output 形如:
+        //   "thinking content...</think>\n\nresponse"
+        // 需要：
+        //   - 历史消息补全 <think> 前缀，保证下一轮模板渲染正确
+        //   - 返回值只包含 response 部分
+        let (stored_output, response_output) = if thinking_forced {
+            // 补全 <think> 前缀用于历史存储
+            let stored = format!("<think>{}", output);
+            // 提取 </think> 之后的响应内容作为返回值
+            let response = if let Some(pos) = output.find("</think>") {
+                output[pos + "</think>".len()..].to_string()
+            } else {
+                // 模型在 thinking 阶段耗尽 token，无有效响应
+                String::new()
+            };
+            (stored, response)
+        } else {
+            (output.clone(), output)
+        };
+
         tracing::info!(
             "本地 LLM 回复完成，长度: {} bytes, 耗时: {:?}, KV: {}/{}",
-            output.len(),
+            response_output.len(),
             duration,
             self.n_past,
             self.ctx.n_ctx()
         );
 
-        // 7. 添加 assistant 消息到历史
-        self.messages.push(ChatMessage::assistant(&output));
+        self.messages.push(ChatMessage::assistant(&stored_output));
         self.stats.turn_count += 1;
         self.stats.tokens_used = self.n_past;
 
-        Ok(output)
+        Ok(response_output)
     }
 
     /// 找出新 tokens 与已编码 tokens 的公共前缀长度
@@ -848,14 +926,20 @@ impl<'a> ManagedSession<'a> {
             .collect();
         let messages_json_str = serde_json::to_string(&messages_json).context("序列化消息失败")?;
 
+        // Pass enable_thinking via chat_template_kwargs so it reaches the Jinja context.
+        // In llama-cpp-2 v0.1.138, some handlers (e.g. qwen3_coder) don't propagate
+        // inputs.enable_thinking to extra_context, so the template variable is undefined.
+        let thinking_kwargs = serde_json::json!({
+            "enable_thinking": self.config.enable_thinking
+        }).to_string();
         let params = OpenAIChatTemplateParams {
             messages_json: &messages_json_str,
             tools_json: self.tools_json.as_deref(),
             tool_choice: None,
             json_schema: None,
             grammar: None,
-            reasoning_format: None,
-            chat_template_kwargs: None,
+            reasoning_format: if self.config.enable_thinking { Some("deepseek") } else { None },
+            chat_template_kwargs: Some(&thinking_kwargs),
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: false,
@@ -891,6 +975,15 @@ impl<'a> ManagedSession<'a> {
         }
     }
 
+    /// Check whether the chat template forces a thinking block open.
+    /// When true, model output starts inside `<think>` (the prompt already includes it).
+    pub fn thinking_forced_open(&self) -> bool {
+        match self.build_prompt() {
+            Ok(result) => result.thinking_forced_open,
+            Err(_) => false,
+        }
+    }
+
     /// 添加消息到历史（不触发生成）
     pub fn add_message(&mut self, message: ChatMessage) {
         self.messages.push(message);
@@ -899,7 +992,7 @@ impl<'a> ManagedSession<'a> {
     /// 设置完整的对话历史
     pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
         self.messages = messages;
-        // 重置编码状态以触发重新 build_prompt 和 diff
+        self.ctx.clear_kv_cache();
         self.n_past = 0;
         self.encoded_tokens.clear();
     }
@@ -962,7 +1055,8 @@ impl<'a> ManagedSession<'a> {
             self.messages.push(s);
         }
 
-        // 重置 KV Cache 状态
+        // 显式清理 KV Cache
+        self.ctx.clear_kv_cache();
         self.n_past = 0;
         self.encoded_tokens.clear();
         self.stats.turn_count = 0;
@@ -972,6 +1066,7 @@ impl<'a> ManagedSession<'a> {
     /// 完全重置会话（包括 system prompt）
     pub fn reset(&mut self) {
         self.messages.clear();
+        self.ctx.clear_kv_cache();
         self.n_past = 0;
         self.encoded_tokens.clear();
         self.stats = SessionStats {
@@ -993,6 +1088,7 @@ impl<'a> ManagedSession<'a> {
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
         self.messages.clear();
         self.messages.push(ChatMessage::system(prompt));
+        self.ctx.clear_kv_cache();
         self.n_past = 0;
         self.encoded_tokens.clear();
     }

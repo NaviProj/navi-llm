@@ -62,8 +62,7 @@ If you answer directly without tool, use tool="message".
     let config = LlmConfig::new(args.model)
         .with_ctx_size(4096)
         .with_system_prompt(system_prompt)
-        // .with_grammar(grammar) // Grammar 暂不可用，见上方注释
-        .with_verbose(true); // 显示详细日志以便观察
+        .with_verbose(true);
 
     let factory = LlmSessionFactory::new(config)?;
     let mut session = factory.create_session()?;

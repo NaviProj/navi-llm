@@ -144,7 +144,7 @@ fn main() -> Result<()> {
         println!("{}", result.prompt);
         println!("========================================");
         println!("✅ 测试模板成功完成");
-        return Ok(());
+        //return Ok(());
     }
 
     let model = LlmModel::load(config)?;

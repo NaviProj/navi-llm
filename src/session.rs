@@ -997,6 +997,15 @@ impl<'a> ManagedSession<'a> {
         self.encoded_tokens.clear();
     }
 
+    /// 替换对话历史，但不清除 KV Cache 和 encoded_tokens。
+    /// chat_impl 的增量编码会通过 find_common_prefix() 检测公共前缀，
+    /// 仅编码差异部分。用于 agent 多轮对话场景的 KV Cache 复用。
+    pub fn replace_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.messages = messages;
+        // 故意不清除 KV cache、n_past、encoded_tokens，
+        // 让 chat_impl 的增量编码处理差异
+    }
+
     /// 获取对话历史
     pub fn history(&self) -> &[ChatMessage] {
         &self.messages

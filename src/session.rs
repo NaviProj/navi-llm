@@ -6,9 +6,12 @@
 use anyhow::{Context, Result};
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::context::LlamaContext;
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -116,6 +119,57 @@ pub struct SessionStats {
     pub cache_hits: usize,
 }
 
+/// System prompt KV cache entry for cross-session reuse.
+struct SystemPromptCacheEntry {
+    /// Temp file containing saved KV state via `state_seq_save_file`.
+    file_path: PathBuf,
+    /// The tokenized system prompt that was cached.
+    tokens: Vec<LlamaToken>,
+    /// Context size used when this cache was created.
+    ctx_size: u32,
+    /// Whether Q8 KV cache quantization was used.
+    kv_cache_q8: bool,
+}
+
+/// Cross-session cache for system prompt KV state.
+///
+/// Allows new sessions to skip re-prefilling the system prompt by restoring
+/// a previously saved KV cache state from a temp file.
+/// Keyed by hash of the tokenized system prompt.
+pub struct SystemPromptCache {
+    entries: HashMap<u64, SystemPromptCacheEntry>,
+    /// Max number of cache entries to keep.
+    max_entries: usize,
+}
+
+impl SystemPromptCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+        }
+    }
+}
+
+impl Drop for SystemPromptCache {
+    fn drop(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            if entry.file_path.exists() {
+                let _ = std::fs::remove_file(&entry.file_path);
+            }
+        }
+    }
+}
+
+/// Hash a token sequence to produce a cache key.
+fn hash_tokens(tokens: &[LlamaToken]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for t in tokens {
+        t.0.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// 会话工厂 - 用于创建和管理会话
 ///
 /// 持有模型和后端，可以创建多个独立的会话。
@@ -126,6 +180,8 @@ pub struct LlmSessionFactory {
     chat_template: LlamaChatTemplate,
     /// 可选的多模态上下文 (视觉投影)
     mtmd_ctx: Option<MtmdContext>,
+    /// Cross-session system prompt KV cache.
+    system_prompt_cache: Mutex<SystemPromptCache>,
 }
 
 impl LlmSessionFactory {
@@ -194,6 +250,7 @@ impl LlmSessionFactory {
             config,
             chat_template,
             mtmd_ctx,
+            system_prompt_cache: Mutex::new(SystemPromptCache::new(5)),
         })
     }
 
@@ -250,6 +307,114 @@ impl LlmSessionFactory {
             config,
             self.chat_template.clone(),
         )
+    }
+
+    /// 创建会话并尝试从缓存恢复 system prompt 的 KV 状态。
+    ///
+    /// 如果缓存命中，跳过 system prompt 的 prefill。
+    /// 如果缓存未命中，主动 prefill system prompt 并保存到缓存供后续 session 使用。
+    pub fn create_session_cached(&self) -> Result<ManagedSession<'_>> {
+        let mut session = self.create_session()?;
+        self.try_warm_system_cache(&mut session)?;
+        Ok(session)
+    }
+
+    /// 创建带完整自定义选项的会话并尝试从缓存恢复 system prompt 的 KV 状态。
+    pub fn create_session_with_full_options_cached(
+        &self,
+        ctx_size: Option<u32>,
+        max_tokens: Option<u32>,
+        kv_cache_q8: Option<bool>,
+        enable_thinking: Option<bool>,
+    ) -> Result<ManagedSession<'_>> {
+        let mut session =
+            self.create_session_with_full_options(ctx_size, max_tokens, kv_cache_q8, enable_thinking)?;
+        self.try_warm_system_cache(&mut session)?;
+        Ok(session)
+    }
+
+    /// Try to restore system prompt KV cache from factory cache, or prefill and save it.
+    fn try_warm_system_cache(&self, session: &mut ManagedSession<'_>) -> Result<()> {
+        let system_tokens = match session.compute_system_prefix_tokens() {
+            Ok(tokens) if !tokens.is_empty() => tokens,
+            _ => return Ok(()), // No system prompt to cache
+        };
+
+        let key = hash_tokens(&system_tokens);
+        let ctx_size = session.ctx.n_ctx();
+        let kv_cache_q8 = session.config.kv_cache_q8;
+
+        // Try restore from cache
+        {
+            let cache = self.system_prompt_cache.lock().unwrap();
+            if let Some(entry) = cache.entries.get(&key) {
+                if entry.ctx_size == ctx_size && entry.kv_cache_q8 == kv_cache_q8 {
+                    match session
+                        .ctx
+                        .state_seq_load_file(&entry.file_path, 0, entry.tokens.len())
+                    {
+                        Ok((tokens, _)) => {
+                            session.encoded_tokens = tokens;
+                            session.n_past = session.encoded_tokens.len() as i32;
+                            tracing::info!(
+                                "[SystemPromptCache] Restored {} tokens from cache",
+                                session.n_past
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[SystemPromptCache] Failed to restore from cache: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cache miss — prefill system prompt and save
+        session.prefill_tokens(&system_tokens)?;
+        tracing::info!(
+            "[SystemPromptCache] Prefilled system prompt ({} tokens), saving to cache",
+            session.n_past
+        );
+
+        let mut cache = self.system_prompt_cache.lock().unwrap();
+
+        // Evict oldest if at capacity
+        if cache.entries.len() >= cache.max_entries && !cache.entries.contains_key(&key) {
+            if let Some(evict_key) = cache.entries.keys().next().copied() {
+                if let Some(entry) = cache.entries.remove(&evict_key) {
+                    let _ = std::fs::remove_file(&entry.file_path);
+                }
+            }
+        }
+
+        let temp_file =
+            std::env::temp_dir().join(format!("navi_llm_sys_cache_{:016x}.bin", key));
+        match session
+            .ctx
+            .state_seq_save_file(&temp_file, 0, &system_tokens)
+        {
+            Ok(_) => {
+                cache.entries.insert(
+                    key,
+                    SystemPromptCacheEntry {
+                        file_path: temp_file,
+                        tokens: system_tokens,
+                        ctx_size,
+                        kv_cache_q8,
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::warn!("[SystemPromptCache] Failed to save cache: {:?}", e);
+                let _ = std::fs::remove_file(&temp_file);
+            }
+        }
+
+        Ok(())
     }
 
     /// 获取模型信息
@@ -502,6 +667,84 @@ impl<'a> ManagedSession<'a> {
         })
     }
 
+    /// Compute the tokenized system prompt prefix (without generation prompt).
+    ///
+    /// Builds the chat template with only the system message and `add_generation_prompt: false`,
+    /// then tokenizes the result. Returns an empty vec if there is no system message.
+    fn compute_system_prefix_tokens(&self) -> Result<Vec<LlamaToken>> {
+        let system_msg = match self.messages.iter().find(|m| m.role == Role::System) {
+            Some(m) => m,
+            None => return Ok(Vec::new()),
+        };
+
+        let messages_json = serde_json::json!([{
+            "role": "system",
+            "content": system_msg.content
+        }]);
+        let messages_json_str = serde_json::to_string(&messages_json)?;
+
+        let thinking_kwargs = serde_json::json!({
+            "enable_thinking": self.config.enable_thinking
+        })
+        .to_string();
+        let params = OpenAIChatTemplateParams {
+            messages_json: &messages_json_str,
+            tools_json: self.tools_json.as_deref(),
+            tool_choice: None,
+            json_schema: None,
+            grammar: None,
+            reasoning_format: if self.config.enable_thinking {
+                Some("deepseek")
+            } else {
+                None
+            },
+            chat_template_kwargs: Some(&thinking_kwargs),
+            add_generation_prompt: false,
+            use_jinja: true,
+            parallel_tool_calls: false,
+            enable_thinking: self.config.enable_thinking,
+            add_bos: false,
+            add_eos: false,
+            parse_tool_calls: self.tools_json.is_some(),
+        };
+
+        let result = self
+            .model
+            .apply_chat_template_oaicompat(&self.chat_template, &params)
+            .context("Failed to build system-only prompt for cache")?;
+
+        let tokens = self
+            .model
+            .str_to_token(&result.prompt, llama_cpp_2::model::AddBos::Never)
+            .context("Failed to tokenize system prompt for cache")?;
+
+        Ok(tokens)
+    }
+
+    /// Prefill the given tokens into the KV cache.
+    ///
+    /// Sets `encoded_tokens` and `n_past` accordingly.
+    fn prefill_tokens(&mut self, tokens: &[LlamaToken]) -> Result<()> {
+        let mut batch = LlamaBatch::new(512, 1);
+        let total = tokens.len();
+
+        for chunk in tokens.chunks(512) {
+            batch.clear();
+            let chunk_len = chunk.len();
+            for (i, token) in chunk.iter().enumerate() {
+                let pos = self.n_past + i as i32;
+                let is_last = (self.n_past + i as i32) == (total as i32 - 1);
+                batch.add(*token, pos, &[0], is_last)?;
+            }
+            self.ctx.decode(&mut batch).context("System prompt prefill failed")?;
+            self.n_past += chunk_len as i32;
+        }
+
+        self.encoded_tokens = tokens.to_vec();
+        self.stats.total_prefilled += tokens.len();
+        Ok(())
+    }
+
     /// 发送用户消息并获取回复（非流式）
     pub fn chat(&mut self, query: &str) -> Result<String> {
         self.chat_impl(Some(query), None::<fn(&str)>)
@@ -593,10 +836,10 @@ impl<'a> ManagedSession<'a> {
         let tokens_to_encode: Vec<LlamaToken> = if self.encoded_tokens.len() < new_tokens.len() {
             new_tokens[self.encoded_tokens.len()..].to_vec()
         } else {
-            // 如果已编码的 tokens 反而更多或相等，这是异常情况
-            // 强制编码最后一个新 token 以获取 logits
-            tracing::warn!(
-                "异常状态: encoded_tokens({}) >= new_tokens({}), 强制编码",
+            // KV cache 完全命中：所有新 tokens 都已在 cache 中，
+            // 只需重新 decode 最后一个 token 来获取 logits
+            tracing::info!(
+                "KV cache 完全命中: encoded_tokens({}) >= new_tokens({}), 重新编码最后一个 token",
                 self.encoded_tokens.len(),
                 new_tokens.len()
             );
@@ -990,11 +1233,13 @@ impl<'a> ManagedSession<'a> {
     }
 
     /// 设置完整的对话历史
+    ///
+    /// 保留 KV Cache 中的已编码状态，不主动清除。下一次 `chat_impl()` 调用时，
+    /// 增量编码机制会自动对比新旧 tokens，复用公共前缀的 KV Cache，
+    /// 仅清除不匹配的后缀并编码新增内容。
     pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
         self.messages = messages;
-        self.ctx.clear_kv_cache();
-        self.n_past = 0;
-        self.encoded_tokens.clear();
+        // 不再清除 KV Cache — chat_impl() 的增量 diff 会自动处理
     }
 
     /// 替换对话历史，但不清除 KV Cache 和 encoded_tokens。
@@ -1047,6 +1292,27 @@ impl<'a> ManagedSession<'a> {
         } else {
             self.stats.cache_hits as f32 / total as f32
         }
+    }
+
+    /// 清除对话历史（保留 system prompt），同时保留 KV Cache 中的已编码状态。
+    ///
+    /// 下一次 `chat_impl()` 调用时，增量编码机制会自动对比新旧 tokens，
+    /// 找出公共前缀（即不变的 system prompt 部分），仅清除变化的后缀并编码新内容。
+    /// 这样避免了每次都重新 prefill 整个 system prompt。
+    pub fn clear_keep_system_prefix(&mut self) {
+        let system = self
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .cloned();
+
+        self.messages.clear();
+        if let Some(s) = system {
+            self.messages.push(s);
+        }
+
+        // 保留 encoded_tokens 和 n_past，让 chat_impl 的增量 diff 自动处理
+        self.stats.turn_count = 0;
     }
 
     /// 清除对话历史（保留 system prompt）

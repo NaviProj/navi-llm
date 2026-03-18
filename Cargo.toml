@@ -30,7 +30,7 @@ cuda = ["llama-cpp-2/cuda"]
 metal = ["llama-cpp-2/metal"]
 
 [dependencies]
-llama-cpp-2 = { version = "=0.1.138", features = ["mtmd"] }
+llama-cpp-2 = { version = "=0.1.139", features = ["mtmd"] }
 anyhow = "1.0"
 tokio = { version = "1.41", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }

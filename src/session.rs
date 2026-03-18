@@ -149,6 +149,38 @@ impl SystemPromptCache {
             max_entries,
         }
     }
+
+    /// Find the best prefix match among cached entries.
+    ///
+    /// Returns the entry and the number of matching prefix tokens if at least
+    /// 75% of the cached entry's tokens match the target. This enables cold-start
+    /// optimization: restore the matching prefix KV state and only prefill the
+    /// remaining suffix tokens.
+    fn find_prefix_match(
+        &self,
+        target_tokens: &[LlamaToken],
+        ctx_size: u32,
+        kv_q8: bool,
+    ) -> Option<(&SystemPromptCacheEntry, usize)> {
+        self.entries
+            .values()
+            .filter(|e| e.ctx_size == ctx_size && e.kv_cache_q8 == kv_q8)
+            .filter_map(|e| {
+                let prefix_len = e
+                    .tokens
+                    .iter()
+                    .zip(target_tokens)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                // Require at least 75% of the cached tokens to match
+                if prefix_len >= e.tokens.len() * 3 / 4 {
+                    Some((e, prefix_len))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(_, len)| *len)
+    }
 }
 
 impl Drop for SystemPromptCache {
@@ -344,7 +376,7 @@ impl LlmSessionFactory {
         let ctx_size = session.ctx.n_ctx();
         let kv_cache_q8 = session.config.kv_cache_q8;
 
-        // Try restore from cache
+        // Try restore from cache (exact match)
         {
             let cache = self.system_prompt_cache.lock().unwrap();
             if let Some(entry) = cache.entries.get(&key) {
@@ -357,7 +389,7 @@ impl LlmSessionFactory {
                             session.encoded_tokens = tokens;
                             session.n_past = session.encoded_tokens.len() as i32;
                             tracing::info!(
-                                "[SystemPromptCache] Restored {} tokens from cache",
+                                "[SystemPromptCache] Restored {} tokens from cache (exact match)",
                                 session.n_past
                             );
                             return Ok(());
@@ -371,9 +403,60 @@ impl LlmSessionFactory {
                     }
                 }
             }
+
+            // Exact miss — try prefix match (cold-start optimization)
+            if let Some((entry, prefix_len)) =
+                cache.find_prefix_match(&system_tokens, ctx_size, kv_cache_q8)
+            {
+                match session
+                    .ctx
+                    .state_seq_load_file(&entry.file_path, 0, entry.tokens.len())
+                {
+                    Ok((tokens, _)) => {
+                        // Restored full cached KV state; truncate to the matching prefix
+                        // and let the remaining suffix be prefilled below.
+                        let truncated = tokens[..prefix_len].to_vec();
+
+                        // Clear KV entries beyond the prefix
+                        let _ = session.ctx.clear_kv_cache_seq(
+                            Some(0),
+                            Some(prefix_len as u32),
+                            Some(tokens.len() as u32),
+                        );
+
+                        session.encoded_tokens = truncated;
+                        session.n_past = prefix_len as i32;
+                        tracing::info!(
+                            "[SystemPromptCache] Restored {} prefix tokens from cache ({} total cached, {} to prefill)",
+                            prefix_len,
+                            tokens.len(),
+                            system_tokens.len() - prefix_len,
+                        );
+
+                        // Prefill the remaining suffix tokens
+                        let suffix = &system_tokens[prefix_len..];
+                        session.prefill_tokens(suffix)?;
+                        // Fall through to save the full KV state to cache
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[SystemPromptCache] Failed to restore prefix from cache: {:?}",
+                            e
+                        );
+                        // Fall through to full prefill
+                    }
+                }
+
+                // If prefix restore + suffix prefill succeeded, save full state
+                if session.n_past == system_tokens.len() as i32 {
+                    let mut cache = self.system_prompt_cache.lock().unwrap();
+                    self.save_to_cache(&mut cache, key, session, &system_tokens, ctx_size, kv_cache_q8);
+                    return Ok(());
+                }
+            }
         }
 
-        // Cache miss — prefill system prompt and save
+        // Full cache miss — prefill entire system prompt and save
         session.prefill_tokens(&system_tokens)?;
         tracing::info!(
             "[SystemPromptCache] Prefilled system prompt ({} tokens), saving to cache",
@@ -381,7 +464,21 @@ impl LlmSessionFactory {
         );
 
         let mut cache = self.system_prompt_cache.lock().unwrap();
+        self.save_to_cache(&mut cache, key, session, &system_tokens, ctx_size, kv_cache_q8);
 
+        Ok(())
+    }
+
+    /// Save the current session's KV state to the system prompt cache.
+    fn save_to_cache(
+        &self,
+        cache: &mut SystemPromptCache,
+        key: u64,
+        session: &ManagedSession<'_>,
+        system_tokens: &[LlamaToken],
+        ctx_size: u32,
+        kv_cache_q8: bool,
+    ) {
         // Evict oldest if at capacity
         if cache.entries.len() >= cache.max_entries && !cache.entries.contains_key(&key) {
             if let Some(evict_key) = cache.entries.keys().next().copied() {
@@ -395,14 +492,14 @@ impl LlmSessionFactory {
             std::env::temp_dir().join(format!("navi_llm_sys_cache_{:016x}.bin", key));
         match session
             .ctx
-            .state_seq_save_file(&temp_file, 0, &system_tokens)
+            .state_seq_save_file(&temp_file, 0, system_tokens)
         {
             Ok(_) => {
                 cache.entries.insert(
                     key,
                     SystemPromptCacheEntry {
                         file_path: temp_file,
-                        tokens: system_tokens,
+                        tokens: system_tokens.to_vec(),
                         ctx_size,
                         kv_cache_q8,
                     },
@@ -413,8 +510,6 @@ impl LlmSessionFactory {
                 let _ = std::fs::remove_file(&temp_file);
             }
         }
-
-        Ok(())
     }
 
     /// 获取模型信息
@@ -924,7 +1019,7 @@ impl<'a> ManagedSession<'a> {
 
         // Thinking 处理：当 thinking_forced_open 为 true 时，模型输出从 <think> 内部开始。
         // 需要将 thinking 内容从回调中过滤，只将 </think> 之后的响应发送给调用方。
-        let thinking_forced = result.thinking_forced_open;
+        let thinking_forced = self.config.enable_thinking && result.thinking_forced_open;
         let mut think_ended = !thinking_forced;
         let mut think_search_start: usize = 0;
 
@@ -1052,7 +1147,10 @@ impl<'a> ManagedSession<'a> {
                 }
             } else if !think_ended {
                 // 正在 thinking 阶段，不发送给回调。仅从最近追加位置附近搜索 </think>
-                let search_from = think_search_start.saturating_sub("</think>".len());
+                let mut search_from = think_search_start.saturating_sub("</think>".len());
+                while !output.is_char_boundary(search_from) && search_from > 0 {
+                    search_from -= 1;
+                }
                 if let Some(rel_pos) = output[search_from..].find("</think>") {
                     think_ended = true;
                     let abs_pos = search_from + rel_pos + "</think>".len();
@@ -1366,6 +1464,23 @@ impl<'a> ManagedSession<'a> {
         self.ctx.clear_kv_cache();
         self.n_past = 0;
         self.encoded_tokens.clear();
+    }
+
+    /// Replace the system prompt text without clearing KV cache or encoded tokens.
+    ///
+    /// The next `chat_impl()` call will use `find_common_prefix()` to detect the
+    /// shared token prefix between old and new prompts, only re-encoding the
+    /// changed suffix. This is ideal when the system prompt has a large static
+    /// prefix and only a small dynamic suffix changes between requests.
+    pub fn replace_system_prompt(&mut self, prompt: impl Into<String>) {
+        let new_content = prompt.into();
+        if let Some(msg) = self.messages.iter_mut().find(|m| m.role == Role::System) {
+            msg.content = new_content;
+        } else {
+            self.messages.insert(0, ChatMessage::system(new_content));
+        }
+        // Intentionally NOT clearing KV cache, n_past, or encoded_tokens.
+        // chat_impl()'s incremental diff via find_common_prefix() will handle it.
     }
 
     /// 获取会话信息

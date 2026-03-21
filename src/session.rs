@@ -672,6 +672,7 @@ const CHECKPOINT_SEQ: i32 = 1;
 /// - 后续轮次：只编码新增的 tokens，复用已有的 KV Cache
 /// - 生成的 tokens 也会被缓存，供下一轮使用
 pub struct ManagedSession<'a> {
+    backend: &'a LlamaBackend,
     ctx: LlamaContext<'a>,
     model: &'a LlamaModel,
     config: LlmConfig,
@@ -728,7 +729,7 @@ fn anchor_pattern(pattern: &str) -> String {
 
 impl<'a> ManagedSession<'a> {
     fn new(
-        backend: &LlamaBackend,
+        backend: &'a LlamaBackend,
         model: &'a LlamaModel,
         config: LlmConfig,
         chat_template: LlamaChatTemplate,
@@ -770,6 +771,7 @@ impl<'a> ManagedSession<'a> {
         let checkpoint_enabled = config.n_seq_max.map_or(false, |n| n >= 2);
 
         Ok(Self {
+            backend,
             ctx,
             model,
             config,
@@ -1705,6 +1707,150 @@ impl<'a> ManagedSession<'a> {
             (remaining / avg_tokens_per_turn) as usize
         } else {
             0
+        }
+    }
+
+
+    /// 为 prompt 提取 embedding。
+    ///
+    /// 优先使用 sequence embedding；若模型不支持 pooling，
+    /// 则回退到 token embedding 的均值。
+    fn prompt_embedding(&self, prompt: &str) -> Result<Vec<f32>> {
+        let mut tokens = self
+            .model
+            .str_to_token(prompt, llama_cpp_2::model::AddBos::Never)
+            .context("提示词分词失败")?;
+
+        let emb_dim = usize::try_from(self.model.n_embd())
+            .expect("n_embd does not fit into usize");
+
+        if tokens.is_empty() {
+            return Ok(vec![0.0; emb_dim]);
+        }
+
+        let max_ctx = self.config.ctx_size.get() as usize;
+        if tokens.len() > max_ctx {
+            tracing::warn!(
+                "prompt tokens exceed ctx_size ({} > {}), truncating for embedding similarity",
+                tokens.len(),
+                max_ctx
+            );
+            tokens.truncate(max_ctx);
+        }
+
+        let mut ctx_params = LlamaContextParams::default()
+            .with_n_ctx(Some(self.config.ctx_size))
+            .with_embeddings(true);
+
+        if self.config.kv_cache_q8 {
+            ctx_params = ctx_params
+                .with_type_k(KvCacheType::Q8_0)
+                .with_type_v(KvCacheType::Q8_0);
+        }
+        if let Some(threads) = self.config.n_threads {
+            ctx_params = ctx_params.with_n_threads(threads);
+        }
+        if let Some(threads_batch) = self.config.n_threads_batch {
+            ctx_params = ctx_params.with_n_threads_batch(threads_batch);
+        }
+
+        let mut sequence_ctx = self
+            .model
+            .new_context(self.backend, ctx_params.clone())
+            .context("无法创建 embedding 上下文")?;
+
+        let mut batch = LlamaBatch::new(512, 1);
+        let mut n_past = 0_i32;
+        for chunk in tokens.chunks(512) {
+            batch.clear();
+            for (i, token) in chunk.iter().enumerate() {
+                let pos = n_past + i as i32;
+                batch.add(*token, pos, &[0], false)?;
+            }
+            sequence_ctx
+                .decode(&mut batch)
+                .context("embedding 序列解码失败")?;
+            n_past += chunk.len() as i32;
+        }
+
+        if let Ok(seq_emb) = sequence_ctx.embeddings_seq_ith(0) {
+            return Ok(seq_emb.to_vec());
+        }
+
+        tracing::debug!("模型不支持 sequence embedding，回退到 token embedding 均值");
+        let mut token_ctx = self
+            .model
+            .new_context(self.backend, ctx_params)
+            .context("无法创建 token embedding 上下文")?;
+
+        let mut sum = vec![0.0_f32; emb_dim];
+        let mut token_count = 0usize;
+        let mut n_past = 0_i32;
+
+        for chunk in tokens.chunks(512) {
+            batch.clear();
+            for (i, token) in chunk.iter().enumerate() {
+                let pos = n_past + i as i32;
+                batch.add(*token, pos, &[0], true)?;
+            }
+            token_ctx
+                .decode(&mut batch)
+                .context("token embedding 解码失败")?;
+
+            for i in 0..chunk.len() {
+                let emb = token_ctx
+                    .embeddings_ith(i as i32)
+                    .context("读取 token embedding 失败")?;
+                for (acc, value) in sum.iter_mut().zip(emb.iter()) {
+                    *acc += *value;
+                }
+                token_count += 1;
+            }
+
+            n_past += chunk.len() as i32;
+        }
+
+        if token_count == 0 {
+            return Ok(vec![0.0; emb_dim]);
+        }
+
+        let inv = 1.0_f32 / token_count as f32;
+        for value in &mut sum {
+            *value *= inv;
+        }
+        Ok(sum)
+    }
+
+
+    /// 使用当前模型的 embedding 计算两个 prompt 的 cosine 相似度。
+    ///
+    /// 返回范围通常在 [-1, 1]，值越大表示语义越接近。
+    pub fn prompt_similarity(&self, prompt1: &str, prompt2: &str) -> Result<f32> {
+        let emb1 = self.prompt_embedding(prompt1)?;
+        let emb2 = self.prompt_embedding(prompt2)?;
+
+        let n = emb1.len().min(emb2.len());
+        if n == 0 {
+            return Ok(1.0);
+        }
+
+        let (dot, norm1, norm2) = emb1
+            .iter()
+            .zip(emb2.iter())
+            .take(n)
+            .fold((0.0_f32, 0.0_f32, 0.0_f32), |(d, a, b), (x, y)| {
+                (d + x * y, a + x * x, b + y * y)
+            });
+
+        let denom = norm1.sqrt() * norm2.sqrt();
+        if denom <= f32::EPSILON {
+            if norm1 <= f32::EPSILON && norm2 <= f32::EPSILON {
+                Ok(1.0)
+            } else {
+                Ok(0.0)
+            }
+        } else {
+            Ok(dot / denom)
         }
     }
 }

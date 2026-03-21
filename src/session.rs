@@ -392,6 +392,10 @@ impl LlmSessionFactory {
                                 "[SystemPromptCache] Restored {} tokens from cache (exact match)",
                                 session.n_past
                             );
+                            // Also create in-memory checkpoint if enabled
+                            if session.checkpoint_enabled && session.checkpoint_len == 0 {
+                                session.create_checkpoint(key);
+                            }
                             return Ok(());
                         }
                         Err(e) => {
@@ -451,6 +455,10 @@ impl LlmSessionFactory {
                 if session.n_past == system_tokens.len() as i32 {
                     let mut cache = self.system_prompt_cache.lock().unwrap();
                     self.save_to_cache(&mut cache, key, session, &system_tokens, ctx_size, kv_cache_q8);
+                    // Also create in-memory checkpoint if enabled
+                    if session.checkpoint_enabled && session.checkpoint_len == 0 {
+                        session.create_checkpoint(key);
+                    }
                     return Ok(());
                 }
             }
@@ -465,6 +473,11 @@ impl LlmSessionFactory {
 
         let mut cache = self.system_prompt_cache.lock().unwrap();
         self.save_to_cache(&mut cache, key, session, &system_tokens, ctx_size, kv_cache_q8);
+
+        // Also create in-memory checkpoint if enabled
+        if session.checkpoint_enabled && session.checkpoint_len == 0 && session.n_past > 0 {
+            session.create_checkpoint(key);
+        }
 
         Ok(())
     }
@@ -648,6 +661,10 @@ impl LlmSessionFactory {
     }
 }
 
+/// KV cache sequence IDs for checkpoint mechanism
+const WORKING_SEQ: i32 = 0;
+const CHECKPOINT_SEQ: i32 = 1;
+
 /// 托管会话 - 管理单次对话的完整上下文
 ///
 /// 使用增量编码方案：
@@ -672,6 +689,12 @@ pub struct ManagedSession<'a> {
     tools_json: Option<String>,
     /// External cancellation flag — checked during token generation
     cancel: Option<Arc<AtomicBool>>,
+    /// Whether checkpoint is enabled (n_seq_max >= 2)
+    checkpoint_enabled: bool,
+    /// Number of tokens in the checkpoint (0 = no checkpoint created)
+    checkpoint_len: i32,
+    /// Hash of the token sequence stored in the checkpoint, for change detection
+    checkpoint_prompt_hash: Option<u64>,
 }
 
 fn regex_escape(value: &str) -> String {
@@ -725,6 +748,10 @@ impl<'a> ManagedSession<'a> {
             ctx_params = ctx_params.with_n_threads_batch(threads_batch);
         }
 
+        if let Some(n) = config.n_seq_max {
+            ctx_params = ctx_params.with_n_seq_max(n);
+        }
+
         tracing::debug!("正在创建新的 LLM 上下文 (ctx_size={})", config.ctx_size);
         let ctx = model
             .new_context(backend, ctx_params)
@@ -739,6 +766,8 @@ impl<'a> ManagedSession<'a> {
         if let Some(ref system_prompt) = config.system_prompt {
             messages.push(ChatMessage::system(system_prompt.clone()));
         }
+
+        let checkpoint_enabled = config.n_seq_max.map_or(false, |n| n >= 2);
 
         Ok(Self {
             ctx,
@@ -759,6 +788,9 @@ impl<'a> ManagedSession<'a> {
             },
             tools_json: None,
             cancel: None,
+            checkpoint_enabled,
+            checkpoint_len: 0,
+            checkpoint_prompt_hash: None,
         })
     }
 
@@ -840,6 +872,114 @@ impl<'a> ManagedSession<'a> {
         Ok(())
     }
 
+    /// Restore KV cache from checkpoint (seq 1 → seq 0).
+    ///
+    /// Returns `Ok(true)` if restored, `Ok(false)` if no checkpoint available.
+    fn restore_checkpoint(&mut self) -> Result<bool> {
+        if !self.checkpoint_enabled || self.checkpoint_len == 0 {
+            return Ok(false);
+        }
+
+        // Full clear of seq 0 (p0=0, p1=None → full removal, always succeeds on hybrid)
+        let _ = self.ctx.clear_kv_cache_seq(Some(0), Some(0), None);
+
+        // Copy checkpoint (seq 1) → working (seq 0)
+        if let Err(e) = self.ctx.copy_kv_cache_seq(CHECKPOINT_SEQ, WORKING_SEQ, None, None) {
+            tracing::warn!("Failed to restore checkpoint: {:?}", e);
+            // seq 0 was already cleared above — must reset state to match
+            self.n_past = 0;
+            self.encoded_tokens.clear();
+            return Ok(false);
+        }
+
+        self.n_past = self.checkpoint_len;
+        self.encoded_tokens.truncate(self.checkpoint_len as usize);
+        tracing::info!(
+            "Restored from checkpoint ({} tokens)",
+            self.checkpoint_len
+        );
+        Ok(true)
+    }
+
+    /// Invalidate the in-memory checkpoint.
+    fn invalidate_checkpoint(&mut self) {
+        if self.checkpoint_len > 0 {
+            // Clear checkpoint sequence
+            let _ = self.ctx.clear_kv_cache_seq(Some(1), Some(0), None);
+            self.checkpoint_len = 0;
+            self.checkpoint_prompt_hash = None;
+            tracing::info!("Checkpoint invalidated");
+        }
+    }
+
+    /// Create a checkpoint from the current KV cache state.
+    ///
+    /// Should only be called when KV cache contains exactly the system prompt prefix.
+    fn create_checkpoint(&mut self, prompt_hash: u64) {
+        if !self.checkpoint_enabled || self.n_past == 0 {
+            return;
+        }
+        match self.ctx.copy_kv_cache_seq(WORKING_SEQ, CHECKPOINT_SEQ, None, None) {
+            Ok(()) => {
+                self.checkpoint_len = self.n_past;
+                self.checkpoint_prompt_hash = Some(prompt_hash);
+                tracing::info!(
+                    "System prompt checkpoint created ({} tokens)",
+                    self.checkpoint_len
+                );
+            }
+            Err(e) => tracing::warn!("Checkpoint creation failed: {:?}", e),
+        }
+    }
+
+    /// 预热 system prompt：prefill system tokens 到 KV cache 并创建 checkpoint。
+    ///
+    /// 使得后续 chat 调用可以直接从 system prompt 边界开始编码，跳过 system prompt 计算。
+    pub fn warmup_system_prompt(&mut self) -> Result<()> {
+        if !self.checkpoint_enabled {
+            return Ok(());
+        }
+
+        let sys_tokens = self.compute_system_prefix_tokens()?;
+        if sys_tokens.is_empty() {
+            return Ok(());
+        }
+
+        let sys_hash = hash_tokens(&sys_tokens);
+
+        // Already have a valid checkpoint for this prompt
+        if self.checkpoint_len > 0 && self.checkpoint_prompt_hash == Some(sys_hash) {
+            return Ok(());
+        }
+
+        // If there's a stale checkpoint, invalidate it and clear seq 0 to rebuild
+        if self.checkpoint_len > 0 {
+            self.invalidate_checkpoint();
+            // Prompt changed — clear seq 0 so we can prefill the new prompt
+            self.ctx.clear_kv_cache();
+            self.n_past = 0;
+            self.encoded_tokens.clear();
+        }
+
+        if self.n_past > 0 {
+            // KV cache has content — check if it's exactly the system prompt
+            if self.encoded_tokens.len() == sys_tokens.len()
+                && self.encoded_tokens == sys_tokens
+            {
+                // KV cache contains exactly system prompt, create checkpoint directly
+            } else {
+                // Has user content, can't safely create checkpoint
+                return Ok(());
+            }
+        } else {
+            // KV cache is empty, prefill system prompt
+            self.prefill_tokens(&sys_tokens)?;
+        }
+
+        self.create_checkpoint(sys_hash);
+        Ok(())
+    }
+
     /// 发送用户消息并获取回复（非流式）
     pub fn chat(&mut self, query: &str) -> Result<String> {
         self.chat_impl(Some(query), None::<fn(&str)>)
@@ -895,7 +1035,7 @@ impl<'a> ManagedSession<'a> {
         );
 
         // 如果公共前缀小于已编码的长度，说明有冲突
-        // 尝试部分清除 KV Cache 保留公共前缀，失败则全量清除
+        // 三级策略：部分清除 → checkpoint 恢复 → 全量清除
         if common_prefix_len < self.encoded_tokens.len() {
             let partial_ok = self
                 .ctx
@@ -907,6 +1047,7 @@ impl<'a> ManagedSession<'a> {
                 .unwrap_or(false);
 
             if partial_ok {
+                // 标准路径（非 hybrid 模型）
                 tracing::info!(
                     "部分清除 KV Cache [{}, {}), 保留公共前缀 {} tokens",
                     common_prefix_len,
@@ -915,7 +1056,19 @@ impl<'a> ManagedSession<'a> {
                 );
                 self.n_past = common_prefix_len as i32;
                 self.encoded_tokens.truncate(common_prefix_len);
+            } else if self.checkpoint_enabled
+                && self.checkpoint_len > 0
+                && common_prefix_len >= self.checkpoint_len as usize
+            {
+                // Checkpoint 路径：恢复到 system prompt 状态，后续只需编码 user 部分
+                tracing::info!(
+                    "部分清除失败, 从 checkpoint 恢复 ({} tokens, common_prefix={})",
+                    self.checkpoint_len,
+                    common_prefix_len
+                );
+                self.restore_checkpoint()?;
             } else {
+                // 兜底：全量清除重编码
                 tracing::warn!(
                     "部分清除 KV Cache 失败, 全量清除并重新编码 (公共前缀: {}, 已编码: {})",
                     common_prefix_len,
@@ -924,6 +1077,24 @@ impl<'a> ManagedSession<'a> {
                 self.ctx.clear_kv_cache();
                 self.n_past = 0;
                 self.encoded_tokens.clear();
+            }
+        }
+
+        // 懒创建 checkpoint：当 KV cache 为空且有 system prompt 时
+        if self.checkpoint_enabled && self.checkpoint_len == 0 && self.n_past == 0 {
+            if let Ok(sys_tokens) = self.compute_system_prefix_tokens() {
+                let sys_len = sys_tokens.len();
+                if sys_len > 0
+                    && new_tokens.len() > sys_len
+                    && new_tokens[..sys_len] == sys_tokens[..]
+                {
+                    // 先单独 prefill system prompt
+                    self.prefill_tokens(&sys_tokens)?;
+                    // 创建 checkpoint（此时 KV cache 仅含 system prompt）
+                    let sys_hash = hash_tokens(&sys_tokens);
+                    self.create_checkpoint(sys_hash);
+                    // 后续 tokens_to_encode 逻辑自动从 sys_len 开始编码剩余部分
+                }
             }
         }
 
@@ -1409,7 +1580,15 @@ impl<'a> ManagedSession<'a> {
             self.messages.push(s);
         }
 
-        // 保留 encoded_tokens 和 n_past，让 chat_impl 的增量 diff 自动处理
+        // 有 checkpoint 时直接恢复到 system prompt 状态（hybrid 模型增量 diff 会失败）
+        if self.checkpoint_enabled && self.checkpoint_len > 0 {
+            if matches!(self.restore_checkpoint(), Ok(true)) {
+                self.stats.turn_count = 0;
+                return;
+            }
+        }
+
+        // 无 checkpoint 时保留 encoded_tokens 和 n_past，让 chat_impl 的增量 diff 自动处理
         self.stats.turn_count = 0;
     }
 
@@ -1428,10 +1607,12 @@ impl<'a> ManagedSession<'a> {
             self.messages.push(s);
         }
 
-        // 显式清理 KV Cache
+        // 显式清理 KV Cache (clears all sequences including checkpoint)
         self.ctx.clear_kv_cache();
         self.n_past = 0;
         self.encoded_tokens.clear();
+        self.checkpoint_len = 0;
+        self.checkpoint_prompt_hash = None;
         self.stats.turn_count = 0;
         self.stats.tokens_used = 0;
     }
@@ -1442,6 +1623,8 @@ impl<'a> ManagedSession<'a> {
         self.ctx.clear_kv_cache();
         self.n_past = 0;
         self.encoded_tokens.clear();
+        self.checkpoint_len = 0;
+        self.checkpoint_prompt_hash = None;
         self.stats = SessionStats {
             tokens_used: 0,
             ctx_size: self.ctx.n_ctx(),
@@ -1464,6 +1647,8 @@ impl<'a> ManagedSession<'a> {
         self.ctx.clear_kv_cache();
         self.n_past = 0;
         self.encoded_tokens.clear();
+        self.checkpoint_len = 0;
+        self.checkpoint_prompt_hash = None;
     }
 
     /// Replace the system prompt text without clearing KV cache or encoded tokens.
@@ -1474,11 +1659,23 @@ impl<'a> ManagedSession<'a> {
     /// prefix and only a small dynamic suffix changes between requests.
     pub fn replace_system_prompt(&mut self, prompt: impl Into<String>) {
         let new_content = prompt.into();
+        let changed = self
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .map_or(true, |m| m.content != new_content);
+
         if let Some(msg) = self.messages.iter_mut().find(|m| m.role == Role::System) {
             msg.content = new_content;
         } else {
             self.messages.insert(0, ChatMessage::system(new_content));
         }
+
+        // Invalidate checkpoint if system prompt changed
+        if changed && self.checkpoint_enabled {
+            self.invalidate_checkpoint();
+        }
+
         // Intentionally NOT clearing KV cache, n_past, or encoded_tokens.
         // chat_impl()'s incremental diff via find_common_prefix() will handle it.
     }

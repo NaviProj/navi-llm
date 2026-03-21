@@ -62,6 +62,10 @@ pub struct LlmConfig {
     /// GPU offload 层数，None 表示使用默认值（不 offload）
     /// 设置为 u32::MAX 表示全部 offload 到 GPU
     pub n_gpu_layers: Option<u32>,
+    /// 最大序列数，None = 默认 1。设置 >= 2 时启用 KV cache checkpoint 功能，
+    /// 允许在 seq 1 中保存 system prompt 的 KV cache 快照，
+    /// 使 hybrid 架构模型（如 Qwen3.5）也能复用 system prompt 缓存。
+    pub n_seq_max: Option<u32>,
 }
 
 impl LlmConfig {
@@ -81,6 +85,7 @@ impl LlmConfig {
             sampling_mode: SamplingMode::default(),
             kv_cache_q8: false,
             n_gpu_layers: None,
+            n_seq_max: None,
         }
     }
 
@@ -197,6 +202,12 @@ impl LlmConfig {
     /// 需要编译时开启 `cuda`（NVIDIA）或 `metal`（Apple）feature。
     pub fn with_n_gpu_layers(mut self, n: u32) -> Self {
         self.n_gpu_layers = Some(n);
+        self
+    }
+
+    /// 设置最大序列数（>= 2 启用 KV cache checkpoint）
+    pub fn with_n_seq_max(mut self, n: u32) -> Self {
+        self.n_seq_max = Some(n);
         self
     }
 }
